@@ -20,6 +20,11 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "CekAnak API v2 running"}
+
+
 @app.post("/process-images")
 async def process_images(
     front_image: UploadFile = File(...),
@@ -35,6 +40,7 @@ async def process_images(
         with open(side_path, "wb") as buffer:
             shutil.copyfileobj(side_image.file, buffer)
 
+        # Proses gambar depan
         front_result = process_image(front_path)
         if not front_result["success"]:
             return {
@@ -42,6 +48,7 @@ async def process_images(
                 "message": front_result["message"],
             }
 
+        # Proses gambar samping
         side_result = process_image_side(side_path)
         if not side_result["success"]:
             return {
@@ -53,17 +60,22 @@ async def process_images(
         lebar_cm = front_result["lebar_cm"]
         tebal_cm = side_result["tebal_cm"]
 
+        # Estimasi berat dengan formula BSA
         berat_kg = estimate_weight(
             tinggi_cm=tinggi_cm,
             lebar_cm=lebar_cm,
             tebal_cm=tebal_cm,
         )
 
+        # Hapus file setelah diproses
+        os.remove(front_path)
+        os.remove(side_path)
+
         return {
             "success": True,
             "data": {
                 "height_cm": tinggi_cm,
-                "weight_kg": round(berat_kg, 2),
+                "weight_kg": berat_kg,
                 "width_cm": lebar_cm,
                 "thickness_cm": tebal_cm,
             },

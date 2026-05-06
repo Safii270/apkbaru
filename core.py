@@ -1,267 +1,185 @@
+import math
 import cv2
 import numpy as np
-import os
-from PIL import Image, ExifTags
 
 # =====================================
 # KONFIGURASI GLOBAL
 # =====================================
-TARGET_WIDTH = 480
-
-TOP_CROP = 0.03
-BOTTOM_CROP = 0.97
-LEFT_CROP = 0.05
-RIGHT_CROP = 0.95
-
-RASIO_CM_PER_PIXEL = 0.22
-
-LOWER_GREEN = np.array([35, 60, 60])
-UPPER_GREEN = np.array([85, 255, 255])
+RASIO = 0.05275
 
 
-def fix_exif_rotation(img_path):
-    pil_img = Image.open(img_path)
+# =========================
+# PEMROSESAN CITRA
+# =========================
+def crop_area(gray_img):
+    h, w = gray_img.shape
+    # Crop fixed pixel seperti MATLAB: citra_gray(200:end-20, 320:1400)
+    row_end = h - 20
+    col_end = min(1400, w)
+    return gray_img[199:row_end, 319:col_end]
+
+
+def threshold_otsu_scaled(gray_img, scale=1.0):
+    otsu_thresh_val, _ = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    scaled_thresh = min(255, int(otsu_thresh_val * scale))
+    _, binary = cv2.threshold(gray_img, scaled_thresh, 255, cv2.THRESH_BINARY)
+    return binary
+
+
+def remove_small_objects(binary_img, min_area=500):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_img, connectivity=8)
+    result = np.zeros_like(binary_img)
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            result[labels == i] = 255
+    return result
+
+
+def fill_holes(binary_img):
+    flood = binary_img.copy()
+    h, w = binary_img.shape
+    mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(flood, mask, (0, 0), 255)
+    flood_inv = cv2.bitwise_not(flood)
+    filled = binary_img | flood_inv
+    return filled
+
+
+def canny_from_binary(binary_img):
+    return cv2.Canny(binary_img, 50, 150)
+
+
+def hitung_batas(edge_img, threshold_col=0):
+    edge_bin = (edge_img > 0).astype(np.uint8)
+
+    sum_bar = edge_bin.sum(axis=1)
+    rows = np.where(sum_bar > 0)[0]
+    if len(rows) == 0:
+        raise ValueError("Objek tidak terdeteksi pada arah baris.")
+    bts_atas = rows[0]
+    bts_bawah = rows[-1]
+
+    sum_kol = edge_bin.sum(axis=0)
+    cols = np.where(sum_kol > threshold_col)[0]
+    if len(cols) == 0:
+        raise ValueError("Objek tidak terdeteksi pada arah kolom.")
+    bts_kiri = cols[0]
+    bts_kanan = cols[-1]
+
+    return bts_atas, bts_bawah, bts_kiri, bts_kanan
+
+
+# =========================
+# PROSES GAMBAR DEPAN
+# =========================
+def process_image(image_path):
+    """
+    Proses citra hadap depan.
+    Return dict dengan tinggi_cm, lebar_cm, A, t, success, message.
+    """
     try:
-        exif = pil_img._getexif()
-        if exif:
-            for tag, value in exif.items():
-                if ExifTags.TAGS.get(tag) == 'Orientation':
-                    if value == 3:
-                        pil_img = pil_img.rotate(180, expand=True)
-                    elif value == 6:
-                        pil_img = pil_img.rotate(270, expand=True)
-                    elif value == 8:
-                        pil_img = pil_img.rotate(90, expand=True)
-    except:
-        pass
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        img_bgr = cv2.imread(image_path)
+        if img_bgr is None:
+            return {"success": False, "message": "Gagal membaca citra depan."}
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        gray_crop = crop_area(gray)
+
+        if gray_crop.size == 0:
+            return {"success": False, "message": "Crop area kosong, cek resolusi gambar."}
+
+        binary = threshold_otsu_scaled(gray_crop, scale=1.2)
+        binary = remove_small_objects(binary, min_area=500)
+        binary = fill_holes(binary)
+
+        edge = canny_from_binary(binary)
+        bts_atas, bts_bawah, bts_kiri, bts_kanan = hitung_batas(edge, threshold_col=0)
+
+        tinggi_pixel = bts_bawah - bts_atas
+        tinggi_cm = tinggi_pixel * RASIO
+        t = tinggi_pixel
+
+        lebar_pixel = bts_kanan - bts_kiri
+        lebar_cm = lebar_pixel * RASIO
+        A = lebar_pixel * 0.385
+
+        return {
+            "success": True,
+            "tinggi_cm": round(tinggi_cm, 2),
+            "lebar_cm": round(lebar_cm, 2),
+            "A": A,
+            "t": t,
+        }
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 
-def process_image(input_path, save_output=True, output_folder="output_hsv"):
-    if save_output:
-        os.makedirs(output_folder, exist_ok=True)
+# =========================
+# PROSES GAMBAR SAMPING
+# =========================
+def process_image_side(image_path):
+    """
+    Proses citra hadap samping.
+    Return dict dengan tebal_cm, B, success, message.
+    """
+    try:
+        img_bgr = cv2.imread(image_path)
+        if img_bgr is None:
+            return {"success": False, "message": "Gagal membaca citra samping."}
 
-    img = fix_exif_rotation(input_path)
-    if img is None:
-        return {"success": False, "message": f"Gambar tidak ditemukan: {input_path}"}
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        gray_crop = crop_area(gray)
 
-    # STEP 1: RESIZE
-    height, width = img.shape[:2]
-    new_height = int(height * TARGET_WIDTH / width)
-    img = cv2.resize(img, (TARGET_WIDTH, new_height))
+        if gray_crop.size == 0:
+            return {"success": False, "message": "Crop area kosong, cek resolusi gambar."}
 
-    # STEP 2: CROP
-    h, w = img.shape[:2]
-    top_crop = int(h * TOP_CROP)
-    bottom_crop = int(h * BOTTOM_CROP)
-    left_crop = int(w * LEFT_CROP)
-    right_crop = int(w * RIGHT_CROP)
-    crop_img = img[top_crop:bottom_crop, left_crop:right_crop]
+        binary = threshold_otsu_scaled(gray_crop, scale=1.0)
+        binary = remove_small_objects(binary, min_area=500)
+        binary = fill_holes(binary)
 
-    # STEP 3: BLUR
-    blur = cv2.GaussianBlur(crop_img, (5, 5), 0)
+        edge = canny_from_binary(binary)
+        bts_atas, bts_bawah, bts_kiri, bts_kanan = hitung_batas(edge, threshold_col=20)
 
-    # STEP 4: HSV
-    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+        lebar_pixel = bts_kanan - bts_kiri
+        tebal_cm = lebar_pixel * RASIO
+        B = lebar_pixel * 0.385
 
-    # STEP 5: MASK BACKGROUND HIJAU
-    green_mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
+        tinggi_pixel = bts_bawah - bts_atas
+        tinggi_cm = tinggi_pixel * RASIO
 
-    # STEP 6: BALIK JADI BODY MASK
-    body_mask = cv2.bitwise_not(green_mask)
+        return {
+            "success": True,
+            "tebal_cm": round(tebal_cm, 2),
+            "tinggi_cm": round(tinggi_cm, 2),
+            "B": B,
+        }
 
-    # STEP 7: MORPHOLOGY
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    body_mask = cv2.morphologyEx(body_mask, cv2.MORPH_OPEN, kernel_open)
-    body_mask = cv2.morphologyEx(body_mask, cv2.MORPH_CLOSE, kernel_close)
-
-    # STEP 8: AMBIL KONTUR TERBESAR
-    contours, _ = cv2.findContours(body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    result = crop_img.copy()
-    clean_mask = np.zeros_like(body_mask)
-
-    if not contours:
-        return {"success": False, "message": "Kontur tubuh tidak ditemukan."}
-
-    largest_contour = max(contours, key=cv2.contourArea)
-    cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
-
-    clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close)
-    kernel_smooth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_smooth)
-    clean_mask = cv2.medianBlur(clean_mask, 5)
-    kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    clean_mask = cv2.erode(clean_mask, kernel_erode, iterations=1)
-
-    contours_final, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours_final:
-        return {"success": False, "message": "Kontur final tidak ditemukan."}
-
-    largest_final = max(contours_final, key=cv2.contourArea)
-
-    # AUTO-CROP
-    x, y, w_box, h_box = cv2.boundingRect(largest_final)
-    x1 = max(0, x - 20)
-    y1 = max(0, y - 10)
-    x2 = min(crop_img.shape[1], x + w_box + 20)
-    y2 = min(crop_img.shape[0], y + h_box + 15)
-
-    crop_img = crop_img[y1:y2, x1:x2]
-    clean_mask = clean_mask[y1:y2, x1:x2]
-    result = crop_img.copy()
-
-    contours_final_crop, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours_final_crop:
-        return {"success": False, "message": "Kontur final setelah auto-crop tidak ditemukan."}
-
-    largest_final = max(contours_final_crop, key=cv2.contourArea)
-    cv2.drawContours(result, [largest_final], -1, (0, 255, 0), 2)
-
-    # STEP 9: UKUR
-    ys, xs = np.where(clean_mask == 255)
-    top_y = np.min(ys)
-    bottom_y = np.max(ys)
-    left_x = np.min(xs)
-    right_x = np.max(xs)
-
-    tinggi_pixel = bottom_y - top_y
-    lebar_pixel = right_x - left_x
-    tinggi_cm = tinggi_pixel * RASIO_CM_PER_PIXEL
-    lebar_cm = lebar_pixel * RASIO_CM_PER_PIXEL
-
-    if save_output:
-        cv2.imwrite(os.path.join(output_folder, "1_resize_crop.jpg"), crop_img)
-        cv2.imwrite(os.path.join(output_folder, "2_blur.jpg"), blur)
-        cv2.imwrite(os.path.join(output_folder, "3_green_mask.jpg"), green_mask)
-        cv2.imwrite(os.path.join(output_folder, "4_body_mask.jpg"), body_mask)
-        cv2.imwrite(os.path.join(output_folder, "5_clean_mask.jpg"), clean_mask)
-        cv2.imwrite(os.path.join(output_folder, "6_result.jpg"), result)
-
-    return {
-        "success": True,
-        "message": "Proses foto depan berhasil",
-        "tinggi_pixel": int(tinggi_pixel),
-        "tinggi_cm": round(tinggi_cm, 2),
-        "lebar_pixel": int(lebar_pixel),
-        "lebar_cm": round(lebar_cm, 2),
-        "crop_img": crop_img,
-        "green_mask": green_mask,
-        "body_mask": body_mask,
-        "clean_mask": clean_mask,
-        "result_img": result
-    }
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 
-def process_image_side(input_path, save_output=True, output_folder="output_side"):
-    if save_output:
-        os.makedirs(output_folder, exist_ok=True)
-
-    img = fix_exif_rotation(input_path)
-    if img is None:
-        return {"success": False, "message": f"Gambar tidak ditemukan: {input_path}"}
-
-    # STEP 1: RESIZE
-    height, width = img.shape[:2]
-    new_height = int(height * TARGET_WIDTH / width)
-    img = cv2.resize(img, (TARGET_WIDTH, new_height))
-
-    # STEP 2: CROP
-    h, w = img.shape[:2]
-    top_crop = int(h * 0.08)
-    bottom_crop = int(h * 0.97)
-    left_crop = int(w * 0.15)
-    right_crop = int(w * 0.90)
-    crop_img = img[top_crop:bottom_crop, left_crop:right_crop]
-
-    # STEP 3: BLUR
-    blur = cv2.GaussianBlur(crop_img, (5, 5), 0)
-
-    # STEP 4: HSV
-    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-
-    # STEP 5: MASK BACKGROUND HIJAU
-    green_mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
-
-    # STEP 6: BALIK JADI BODY MASK
-    body_mask = cv2.bitwise_not(green_mask)
-
-    # STEP 7: MORPHOLOGY
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    body_mask = cv2.morphologyEx(body_mask, cv2.MORPH_OPEN, kernel_open)
-    body_mask = cv2.morphologyEx(body_mask, cv2.MORPH_CLOSE, kernel_close)
-
-    # STEP 8: AMBIL KONTUR TERBESAR
-    contours, _ = cv2.findContours(body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    result = crop_img.copy()
-    clean_mask = np.zeros_like(body_mask)
-
-    if not contours:
-        return {"success": False, "message": "Kontur tubuh samping tidak ditemukan."}
-
-    largest_contour = max(contours, key=cv2.contourArea)
-    cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
-
-    clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close)
-    kernel_smooth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_smooth)
-    clean_mask = cv2.medianBlur(clean_mask, 5)
-
-    contours_final, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours_final:
-        return {"success": False, "message": "Kontur final samping tidak ditemukan."}
-
-    largest_final = max(contours_final, key=cv2.contourArea)
-    cv2.drawContours(result, [largest_final], -1, (0, 255, 0), 2)
-
-    # AUTO-CROP
-    x, y, w_box, h_box = cv2.boundingRect(largest_final)
-    x1 = max(0, x - 10)
-    y1 = max(0, y - 10)
-    x2 = min(clean_mask.shape[1], x + w_box + 10)
-    y2 = min(clean_mask.shape[0], y + h_box + 20)
-
-    focused_mask = clean_mask[y1:y2, x1:x2]
-    focused_result = result[y1:y2, x1:x2]
-
-    ys, xs = np.where(focused_mask == 255)
-    top_y = np.min(ys)
-    bottom_y = np.max(ys)
-    left_x = np.min(xs)
-    right_x = np.max(xs)
-
-    tinggi_pixel = bottom_y - top_y
-    tebal_pixel = right_x - left_x
-    tinggi_cm = tinggi_pixel * RASIO_CM_PER_PIXEL
-    tebal_cm = tebal_pixel * RASIO_CM_PER_PIXEL
-
-    result = focused_result
-    clean_mask = focused_mask
-
-    if save_output:
-        cv2.imwrite(os.path.join(output_folder, "1_resize_crop.jpg"), crop_img)
-        cv2.imwrite(os.path.join(output_folder, "2_blur.jpg"), blur)
-        cv2.imwrite(os.path.join(output_folder, "3_green_mask.jpg"), green_mask)
-        cv2.imwrite(os.path.join(output_folder, "4_body_mask.jpg"), body_mask)
-        cv2.imwrite(os.path.join(output_folder, "5_clean_mask.jpg"), clean_mask)
-        cv2.imwrite(os.path.join(output_folder, "6_result.jpg"), result)
-
-    return {
-        "success": True,
-        "message": "Proses foto samping berhasil",
-        "tinggi_pixel": int(tinggi_pixel),
-        "tinggi_cm": round(tinggi_cm, 2),
-        "tebal_pixel": int(tebal_pixel),
-        "tebal_cm": round(tebal_cm, 2),
-        "crop_img": crop_img,
-        "green_mask": green_mask,
-        "body_mask": body_mask,
-        "clean_mask": clean_mask,
-        "result_img": result
-    }
-
-
+# =========================
+# ESTIMASI BERAT BADAN (BSA)
+# =========================
 def estimate_weight(tinggi_cm, lebar_cm, tebal_cm):
-    berat = 0.23 * tinggi_cm - 8.5
-    return berat
+    """
+    Estimasi berat badan menggunakan formula BSA ellipse.
+    A dan B dihitung ulang dari lebar dan tebal dalam pixel.
+    """
+    # Konversi balik ke pixel untuk A dan B
+    A = (lebar_cm / RASIO) * 0.385
+    B = (tebal_cm / RASIO) * 0.385
+    t = tinggi_cm / RASIO  # tinggi dalam pixel
+
+    h = ((A - B) ** 2) / ((A + B) ** 2)
+
+    BSA = (
+        2 * (math.pi / 2 * (A * B)) +
+        (math.pi / 2 * (A + B) * (1 + ((3 * h) / (10 + math.sqrt(4 - 3 * h)))) * t)
+    ) * 1e-5 * RASIO
+
+    berat_kg = (BSA ** 2) * 3600 / (t * RASIO)
+
+    return round(berat_kg, 2)
