@@ -2,45 +2,35 @@ import math
 import cv2
 import numpy as np
 
-# =====================================
-# KONFIGURASI GLOBAL
-# =====================================
 RASIO = 0.05275
 
-
-# =========================
-# PEMROSESAN CITRA
-# =========================
-def crop_area(gray_img):
-    h, w = gray_img.shape
-
-    # Crop proporsional agar works di semua resolusi HP
-    top    = int(h * 0.10)
-    bottom = int(h * 0.98)
-    left   = int(w * 0.15)
-    right  = int(w * 0.95)
-
-    cropped = gray_img[top:bottom, left:right]
-
-    if cropped.size == 0:
-        return gray_img  # fallback gambar asli
-
-    return cropped
-
-
-def threshold_otsu_scaled(gray_img, scale=1.0):
-    otsu_thresh_val, _ = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    scaled_thresh = min(255, int(otsu_thresh_val * scale))
-    _, binary = cv2.threshold(gray_img, scaled_thresh, 255, cv2.THRESH_BINARY)
-    return binary
+def remove_green_background(img_bgr):
+    """Deteksi objek dengan menghapus background hijau (chroma key)"""
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    
+    # Range warna hijau di HSV
+    lower_green = np.array([35, 40, 40])
+    upper_green = np.array([85, 255, 255])
+    
+    # Mask hijau = background
+    green_mask = cv2.inRange(hsv, lower_green, upper_green)
+    
+    # Invert: objek = putih, background = hitam
+    object_mask = cv2.bitwise_not(green_mask)
+    
+    # Bersihkan noise
+    kernel = np.ones((5, 5), np.uint8)
+    object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_OPEN, kernel)
+    object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_CLOSE, kernel)
+    
+    return object_mask
 
 
 def remove_small_objects(binary_img, min_area=500):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_img, connectivity=8)
     result = np.zeros_like(binary_img)
     for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area >= min_area:
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
             result[labels == i] = 255
     return result
 
@@ -51,8 +41,7 @@ def fill_holes(binary_img):
     mask = np.zeros((h + 2, w + 2), np.uint8)
     cv2.floodFill(flood, mask, (0, 0), 255)
     flood_inv = cv2.bitwise_not(flood)
-    filled = binary_img | flood_inv
-    return filled
+    return binary_img | flood_inv
 
 
 def canny_from_binary(binary_img):
@@ -72,7 +61,7 @@ def hitung_batas(edge_img, threshold_col=0):
     sum_kol = edge_bin.sum(axis=0)
     cols = np.where(sum_kol > threshold_col)[0]
     if len(cols) == 0:
-        cols = np.where(sum_kol > 0)[0]  # fallback threshold 0
+        cols = np.where(sum_kol > 0)[0]
     if len(cols) == 0:
         raise ValueError("Objek tidak terdeteksi pada arah kolom.")
     bts_kiri  = cols[0]
@@ -81,26 +70,17 @@ def hitung_batas(edge_img, threshold_col=0):
     return bts_atas, bts_bawah, bts_kiri, bts_kanan
 
 
-# =========================
-# PROSES GAMBAR DEPAN
-# =========================
 def process_image(image_path):
     try:
         img_bgr = cv2.imread(image_path)
         if img_bgr is None:
             return {"success": False, "message": "Gagal membaca citra depan."}
 
-        # Resize agar konsisten
         img_bgr = cv2.resize(img_bgr, (800, 1200))
 
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        gray_crop = crop_area(gray)
-
-        if gray_crop.size == 0:
-            return {"success": False, "message": "Crop area kosong."}
-
-        binary = threshold_otsu_scaled(gray_crop, scale=1.2)
-        binary = remove_small_objects(binary, min_area=500)
+        # Gunakan green screen removal
+        binary = remove_green_background(img_bgr)
+        binary = remove_small_objects(binary, min_area=1000)
         binary = fill_holes(binary)
 
         edge = canny_from_binary(binary)
@@ -108,70 +88,53 @@ def process_image(image_path):
 
         tinggi_pixel = bts_bawah - bts_atas
         tinggi_cm    = tinggi_pixel * RASIO
-        t            = tinggi_pixel
-
-        lebar_pixel = bts_kanan - bts_kiri
-        lebar_cm    = lebar_pixel * RASIO
-        A           = lebar_pixel * 0.385
+        lebar_pixel  = bts_kanan - bts_kiri
+        lebar_cm     = lebar_pixel * RASIO
 
         return {
             "success":   True,
             "tinggi_cm": round(tinggi_cm, 2),
             "lebar_cm":  round(lebar_cm, 2),
-            "A":         A,
-            "t":         t,
+            "A":         lebar_pixel * 0.385,
+            "t":         tinggi_pixel,
         }
 
     except Exception as e:
         return {"success": False, "message": str(e)}
 
 
-# =========================
-# PROSES GAMBAR SAMPING
-# =========================
 def process_image_side(image_path):
     try:
         img_bgr = cv2.imread(image_path)
         if img_bgr is None:
             return {"success": False, "message": "Gagal membaca citra samping."}
 
-        # Resize agar konsisten
         img_bgr = cv2.resize(img_bgr, (800, 1200))
 
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        gray_crop = crop_area(gray)
-
-        if gray_crop.size == 0:
-            return {"success": False, "message": "Crop area kosong."}
-
-        binary = threshold_otsu_scaled(gray_crop, scale=1.0)
-        binary = remove_small_objects(binary, min_area=500)
+        # Gunakan green screen removal
+        binary = remove_green_background(img_bgr)
+        binary = remove_small_objects(binary, min_area=1000)
         binary = fill_holes(binary)
 
         edge = canny_from_binary(binary)
-        bts_atas, bts_bawah, bts_kiri, bts_kanan = hitung_batas(edge, threshold_col=20)
+        bts_atas, bts_bawah, bts_kiri, bts_kanan = hitung_batas(edge, threshold_col=0)
 
-        lebar_pixel = bts_kanan - bts_kiri
-        tebal_cm    = lebar_pixel * RASIO
-        B           = lebar_pixel * 0.385
-
+        lebar_pixel  = bts_kanan - bts_kiri
+        tebal_cm     = lebar_pixel * RASIO
         tinggi_pixel = bts_bawah - bts_atas
         tinggi_cm    = tinggi_pixel * RASIO
 
         return {
-            "success":  True,
-            "tebal_cm": round(tebal_cm, 2),
+            "success":   True,
+            "tebal_cm":  round(tebal_cm, 2),
             "tinggi_cm": round(tinggi_cm, 2),
-            "B":         B,
+            "B":         lebar_pixel * 0.385,
         }
 
     except Exception as e:
         return {"success": False, "message": str(e)}
 
 
-# =========================
-# ESTIMASI BERAT BADAN (BSA)
-# =========================
 def estimate_weight(tinggi_cm, lebar_cm, tebal_cm):
     A = (lebar_cm / RASIO) * 0.385
     B = (tebal_cm / RASIO) * 0.385
